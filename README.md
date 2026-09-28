@@ -20,7 +20,9 @@ python scripts/hz_bot.py --token <令牌> --server https://10.240.169.190:18080 
 ## 自测（本地假服务器，无需真实平台）
 
 ```bash
-python scripts/verify_tournament_e2e2.py --budget 300
+python scripts/verify_tournament_e2e2.py --budget 420
 ```
+
+> ⚠️ 自测里的 `stage_open/确认` 依赖阶段推进落在预算内，**预算不足会假失败**（实测 300s 偶发 5~6/7、420~540s 稳定 7/7）⇒ 建议 `--budget 420` 以上。
 
 环境：**Python 3.8+，纯标准库，无第三方依赖**。
