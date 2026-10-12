@@ -261,6 +261,10 @@ class GameState:
         self.piao = 0                # 链内已飘出的白板数（4 白板 = 手留 + 链内飘出）
         self.restricted = False      # 本人处于抓打圈受限（只能打刚摸的、不可吃碰杠）
         self.god_discarder = -1
+        # ⭐ 10/10 加固（见 apply / do_draw）：手牌一致性账本 + 失步重建次数 + 抓打圈起始 draw_id
+        self.hand_n = 0            # 权威手牌张数（快照锚定 + 事件增量）
+        self.desync_tries = {}     # draw_id -> 已尝试重建次数（防死循环 ✓）
+        self.restricted_draw_id = -1
         self.circle_left = 0
         self.phase = "idle"
         self.turn = -1
@@ -315,6 +319,10 @@ class GameState:
         self.god_discarder = gds if cp else -1
         self.restricted = cp and gds != self.me
         self.circle_left = 3 if cp else 0   # 近似（圈内剩余受限出牌数未知，按事件递减到 0 即清）
+        # ⭐ 账本锚定：快照里的手牌是权威值 ✓（之后由 apply 按事件增量维护）
+        self.hand_n = len(s.get("my_hand") or [])
+        self.restricted_draw_id = self.draw_id if self.restricted else -1
+        self.desync_tries.clear()
         # last_discard_seat 推断：响应阶段 turn 通常为出牌者；否则找河牌末尾匹配
         src = s.get("last_discard_seat")
         if src is None and self.last_discard:
@@ -333,6 +341,31 @@ class GameState:
 
     # ---- 事件 ----
     def apply(self, e):
+        """⭐ 10/10 加固：**手牌一致性账本**。
+
+        `hand_n` = 权威手牌张数（每次收到快照时锚定为 len(snapshot.my_hand)，之后按事件增量维护）。
+        本地 `self.hand` 由各事件分支增量维护 ⇒ **两者不等 = 中间丢了事件**（10/8 第 2 轮实测：
+        bot 侧 dump 丢了 42% 的局，且"实战出牌 ≠ 引擎在真局面下的选择"出现 179 次 ✗✗）
+        ⇒ 决策前由 `do_draw` 的闸门发现并**重建**，绝不按一副错牌出手 ✓
+        这里集中记账（而不是散在 7 个分支里）是为了只有一处口径、不会漏 ✗→✓
+        """
+        r = self._apply(e)
+        s, t = e.get("seat"), e.get("type")
+        if s == self.me and self.hand_n:
+            k = (e.get("data") or {}).get("kind")
+            if t == "tile_drawn":
+                self.hand_n += 1
+            elif t == "tile_discarded":
+                self.hand_n -= 1
+            elif t == "peng":
+                self.hand_n -= 2
+            elif t == "chi":
+                self.hand_n -= 2
+            elif t == "gang":
+                self.hand_n -= {"an": 4, "bu": 1}.get(k, 3)
+        return r
+
+    def _apply(self, e):
         """返回触发器：my_draw / my_turn / window / peng_closed / round_ended / game_ended / None"""
         t = e.get("type")
         s = e.get("seat")
@@ -550,7 +583,25 @@ class GamePlayer:
         try:
             r = api("POST", f"/api/games/{self.gid}/action", a)
             tm = self._timing(t0)
-            _dump(self.gid, "post_ok", {"act": a, "why": why, "resp": r, "ms": round(tm["post"] * 1000), "tm": tm})
+            # ⭐ 10/10 加：**决策时刻 bot 自身状态**一起落盘。
+            #   为什么必须加：10/8 第 2 轮复盘卡住的根因就是——**平台侧记录完整，但"bot 以为自己手里是什么牌"
+            #   从未落盘** ✗；而 bot 侧 dump 当时又丢了 42% 的局 ⇒ 连唯一的间接证据也没了 ✗✗
+            #   有了这几个字段，事后可一眼区分三类机制（现在只是候选）：
+            #     · hand_sum != hand_n      ⇒ 手牌张数失步（丢事件）
+            #     · hand_sum == hand_n 但仍劣着 ⇒ 同尺寸错牌（事件乱序/错配）
+            #     · restricted=True 且不该受限 ⇒ 抓打圈受限态残留
+            #   纯记录、几字节/手，不改变任何决策 ✓
+            _dbg = {}
+            try:
+                _st = getattr(self, "st", None)
+                if _st is not None:
+                    _dbg = {"hand_n": _st.hand_n, "hand_sum": sum(_st.hand), "drawn": _st.drawn,
+                            "restricted": bool(_st.restricted), "circle": _st.circle_left,
+                            "wall": _st.wall, "melds": len(_st.melds[_st.me]) if _st.me is not None else 0}
+            except Exception:
+                _dbg = {"err": "dbg_failed"}
+            _dump(self.gid, "post_ok", {"act": a, "why": why, "resp": r,
+                                        "ms": round(tm["post"] * 1000), "tm": tm, "dbg": _dbg})
             stat("post_ok")
             if tm["since_rx"] > 1.5:
                 # 收到事件 → 提交完成 超过 1.5s：距 3s 出牌窗口已很近，单独告警并分解（谁慢：决策/排队/网络）
@@ -582,6 +633,27 @@ class GamePlayer:
         st = self.st
         if self.acted_draw_id == st.draw_id:
             return
+        # ⭐ 闸门一：**手牌失步 ⇒ 先重建再决策**（10/10 加固）
+        #   判据：本地手牌张数 != 账本（快照锚定 + 事件增量）⇒ 中间丢了事件 ⇒
+        #   此时 brain 看到的是一副错牌 ⇒ 出牌必然不是引擎的判断（10/8 第 2 轮实测 179 次 ✗✗）
+        #   防死循环：同一 draw_id 最多重建 1 次，之后照常决策（fail-open，绝不卡住比赛 ✓）
+        if allow_rebuild and st.hand_n and sum(st.hand) != st.hand_n \
+                and st.desync_tries.get(st.draw_id, 0) < 1:
+            st.desync_tries[st.draw_id] = st.desync_tries.get(st.draw_id, 0) + 1
+            log(self.tag, "⚠ 手牌失步（本地 %d / 权威 %d）⇒ 重建后再决策"
+                % (sum(st.hand), st.hand_n))
+            self.rebuild("hand_desync", allow_rebuild=False)
+            return
+        # ⭐ 闸门二：**抓打圈受限态最长只能跨 1 个自己的摸牌回合**（10/10 加固）
+        #   受限态正常由"我们自己出牌"或"圈走满事件"清除；丢事件会让它残留 ⇒
+        #   引擎被永久强制"打什么摸什么"（与 10/8 第 2 轮"劣着 179/179 全是打刚摸的牌"吻合 ✗）
+        if st.restricted and st.restricted_draw_id >= 0 \
+                and st.draw_id - st.restricted_draw_id >= 2:
+            log(self.tag, "⚠ 受限态残留（跨 %d 个自己的摸牌回合）⇒ 强制解除 ✓"
+                % (st.draw_id - st.restricted_draw_id))
+            st.restricted = False
+            st.circle_left = 0
+            st.god_discarder = -1
         self.acted_draw_id = st.draw_id
         t0 = time.monotonic()
         snap = st.snap("draw", st.me, [])
